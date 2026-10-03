@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
 from pydantic import BaseModel
 
 from analyzer import analyzer_from_env, load_graph_file
@@ -23,6 +24,7 @@ from mev_scanner import MevScanner, scanner_from_env
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 DATA.mkdir(exist_ok=True)
+load_dotenv(Path(__file__).resolve().parent / ".env")
 logger = logging.getLogger(__name__)
 mev_scanner: MevScanner | None = None
 

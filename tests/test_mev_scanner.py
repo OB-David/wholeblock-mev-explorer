@@ -100,18 +100,63 @@ def test_extracts_v2_and_v3_event_swaps():
 def test_store_anchors_each_session_at_current_head(tmp_path):
     store = MevStore(tmp_path)
 
-    assert store.begin_session(100) == (100, 99)
+    assert store.begin_session(100, 91) == (100, 99)
     assert store.metadata("session_start_block") == "100"
+    assert store.metadata("history_start_block") == "91"
     assert store.metadata("backfill_next") == "99"
     store.set_metadata("last_scanned", 102)
     restarted = MevStore(tmp_path)
-    assert restarted.begin_session(110) == (110, 109)
+    assert restarted.begin_session(110, 101) == (110, 109)
     assert restarted.metadata("session_start_block") == "110"
+    assert restarted.metadata("history_start_block") == "101"
     assert restarted.metadata("last_scanned") == "109"
     assert restarted.metadata("backfill_next") == "109"
     assert restarted.metadata("start_block") == "100"
     assert (tmp_path / "mev" / "arbitrages.sqlite3").is_file()
     assert (tmp_path / "mev" / "sandwiches.sqlite3").is_file()
+
+
+def test_store_prunes_only_quick_scan_history(tmp_path):
+    store = MevStore(tmp_path)
+    graph = tmp_path / "90" / "graph.json"
+    trace = tmp_path / "90" / "traces" / "0000.json.gz"
+    graph.parent.mkdir(parents=True)
+    trace.parent.mkdir()
+    graph.write_text("{}")
+    trace.write_bytes(b"trace")
+
+    with store._connect(store.arbitrage_path) as db:
+        db.executemany(
+            "INSERT INTO blocks(block_number,scan_status) VALUES (?,'scanned')",
+            [(90,), (91,), (92,)],
+        )
+        db.executemany(
+            "INSERT INTO arbitrages(block_number,tx_hash,tx_position,account_address,profit_token_address,"
+            "start_amount,end_amount,profit_amount,swap_count,route_json) VALUES (?,'0xtx',0,'0xa','0xt','1','2','1',1,'[]')",
+            [(90,), (92,)],
+        )
+        db.execute(
+            "INSERT INTO pools(pool_address,token0,token1,updated_block) VALUES ('0xp','0x0','0x1',90)",
+        )
+    with store._connect(store.sandwich_path) as db:
+        db.executemany(
+            "INSERT INTO sandwiches(block_number,pool_address,attacker_address,profit_token_address,profit_amount,"
+            "front_tx_hash,front_tx_position,back_tx_hash,back_tx_position,victims_json,swaps_json) "
+            "VALUES (?,'0xp','0xa','0xt','1','0xf',0,'0xb',1,'[]','{}')",
+            [(90,), (92,)],
+        )
+
+    removed = store.prune_before(92)
+
+    with store._connect(store.arbitrage_path) as db:
+        assert [row[0] for row in db.execute("SELECT block_number FROM blocks")] == [92]
+        assert [row[0] for row in db.execute("SELECT block_number FROM arbitrages")] == [92]
+        assert db.execute("SELECT COUNT(*) FROM pools").fetchone()[0] == 1
+    with store._connect(store.sandwich_path) as db:
+        assert [row[0] for row in db.execute("SELECT block_number FROM sandwiches")] == [92]
+    assert removed == {"blocks": 2, "arbitrages": 1, "sandwiches": 1}
+    assert store.metadata("start_block") == "92"
+    assert graph.is_file() and trace.is_file()
 
 
 class _WorkerStore:
@@ -135,7 +180,7 @@ def _worker_scanner(store):
     scanner.stop_event = threading.Event()
     scanner.head_ready_event = threading.Event()
     scanner.poll_seconds = 0
-    scanner.backfill_start_block = 0
+    scanner.history_start_block = 0
     scanner.forward_block = None
     scanner.backfill_block = None
     scanner.forward_error = None
@@ -176,6 +221,72 @@ def test_backfill_worker_skips_scanned_blocks_and_descends():
 
     assert scanned == [98]
     assert scanner.store.metadata_values["backfill_next"] == 97
+
+
+def test_backfill_worker_stops_at_session_history_boundary():
+    scanner = _worker_scanner(_WorkerStore())
+    scanner.head_ready_event.set()
+    scanner.history_start_block = 98
+    scanned = []
+
+    def scan_block(number):
+        scanned.append(number)
+        return {"swaps": 0, "arbitrages": 0, "sandwiches": 0, "elapsed_ms": 1}
+
+    scanner.scan_block = scan_block
+    scanner._backfill_history(99)
+
+    assert scanned == [99, 98]
+    assert scanner.store.metadata_values["backfill_next"] == 97
+
+
+class _ExplorerStore:
+    def __init__(self):
+        self.values = {
+            "session_start_block": "100",
+            "history_start_block": "91",
+            "last_scanned": "100",
+        }
+
+    def metadata(self, key):
+        return self.values.get(key)
+
+    def labels(self, first, last):
+        return {}
+
+
+def test_explorer_pages_stay_inside_session_history_window():
+    scanner = object.__new__(MevScanner)
+    scanner.web3 = SimpleNamespace(eth=SimpleNamespace(block_number=100))
+    scanner.store = _ExplorerStore()
+    scanner.history_blocks = 10
+    scanner.forward_block = None
+    scanner.backfill_block = None
+    scanner.forward_error = None
+    scanner.backfill_error = None
+
+    def rpc_batch(calls):
+        return [
+            {
+                "hash": hex(int(params[0], 16)), "timestamp": "0x1",
+                "transactions": [], "gasUsed": "0x0", "gasLimit": "0x1", "baseFeePerGas": "0x0",
+            }
+            for _, params in calls
+        ]
+
+    scanner._rpc_batch = rpc_batch
+
+    newest = scanner.explorer(limit=4)
+    middle = scanner.explorer(limit=4, before=96)
+    oldest = scanner.explorer(limit=4, before=92)
+
+    assert [block["number"] for block in newest["blocks"]] == [100, 99, 98, 97]
+    assert newest["has_newer"] is False and newest["has_older"] is True
+    assert [block["number"] for block in middle["blocks"]] == [96, 95, 94, 93]
+    assert middle["has_newer"] is True and middle["has_older"] is True
+    assert [block["number"] for block in oldest["blocks"]] == [92, 91]
+    assert oldest["start_block"] == 91
+    assert oldest["has_newer"] is True and oldest["has_older"] is False
 
 
 def _transfer_call(token, sender, recipient, amount):

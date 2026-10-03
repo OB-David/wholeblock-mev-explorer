@@ -41,6 +41,7 @@ export interface ExplorerBlock {
 }
 export interface ExplorerResponse {
   latest: number; start_block: number | null; session_start_block: number | null;
+  history_blocks: number; has_newer: boolean; has_older: boolean;
   last_scanned: number | null; scanning_block: number | null; backfill_block: number | null;
   scanner_error: string | null; backfill_error: string | null; blocks: ExplorerBlock[]
 }

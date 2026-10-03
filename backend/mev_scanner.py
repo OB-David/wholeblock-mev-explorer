@@ -22,7 +22,6 @@ from dotenv import load_dotenv
 from web3 import Web3
 
 from sandwiches import extract_exchange_occurrences
-from utils.evm_information import GETH_TRACE_START_BLOCK
 
 
 logger = logging.getLogger(__name__)
@@ -419,11 +418,12 @@ class MevStore:
                 (key, str(value)),
             )
 
-    def begin_session(self, latest: int) -> tuple[int, int]:
+    def begin_session(self, latest: int, history_start: int) -> tuple[int, int]:
         """Anchor both workers at the head observed for this server session."""
 
         self.set_metadata("detector_version", DETECTOR_VERSION)
         self.set_metadata("session_start_block", latest)
+        self.set_metadata("history_start_block", history_start)
         self.set_metadata("last_scanned", latest - 1)
         self.set_metadata("backfill_next", latest - 1)
         if self.metadata("start_block") is None:
@@ -437,6 +437,34 @@ class MevStore:
                 (number,),
             ).fetchone()
             return row is not None
+
+    def prune_before(self, first_block: int) -> dict[str, int]:
+        """Drop quick-scan rows outside the active history window."""
+
+        with self._connect(self.arbitrage_path) as db:
+            arbitrages = db.execute(
+                "DELETE FROM arbitrages WHERE block_number < ?", (first_block,),
+            ).rowcount
+            blocks = db.execute(
+                "DELETE FROM blocks WHERE block_number < ?", (first_block,),
+            ).rowcount
+            db.execute(
+                "INSERT INTO metadata(key,value) VALUES ('start_block',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(first_block),),
+            )
+        with self._connect(self.sandwich_path) as db:
+            sandwiches = db.execute(
+                "DELETE FROM sandwiches WHERE block_number < ?", (first_block,),
+            ).rowcount
+
+        if blocks or arbitrages:
+            with self._connect(self.arbitrage_path) as db:
+                db.execute("VACUUM")
+        if sandwiches:
+            with self._connect(self.sandwich_path) as db:
+                db.execute("VACUUM")
+        return {"blocks": blocks, "arbitrages": arbitrages, "sandwiches": sandwiches}
 
     def pool_tokens(self, addresses: Iterable[str]) -> dict[str, tuple[str, str]]:
         addresses = list(dict.fromkeys(addresses))
@@ -546,7 +574,7 @@ class MevScanner:
         rpc_url: str,
         data_dir: Path,
         poll_seconds: float = 3.0,
-        backfill_start_block: int = GETH_TRACE_START_BLOCK,
+        history_blocks: int = 1_800,
     ):
         self.rpc_url = rpc_url
         self.web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
@@ -554,7 +582,8 @@ class MevScanner:
             raise ConnectionError("无法连接 GETH_API")
         self.store = MevStore(data_dir)
         self.poll_seconds = poll_seconds
-        self.backfill_start_block = max(0, backfill_start_block)
+        self.history_blocks = max(1, history_blocks)
+        self.history_start_block = 0
         self.stop_event = threading.Event()
         self.head_ready_event = threading.Event()
         self.head_thread: threading.Thread | None = None
@@ -569,7 +598,14 @@ class MevScanner:
 
     def start(self) -> None:
         latest = int(self.web3.eth.block_number)
-        self.store.begin_session(latest)
+        self.history_start_block = max(0, latest - self.history_blocks + 1)
+        self.store.begin_session(latest, self.history_start_block)
+        pruned = self.store.prune_before(self.history_start_block)
+        if any(pruned.values()):
+            logger.info(
+                "MEV 快速扫描历史清理 blocks=%d arbitrages=%d sandwiches=%d before=%d",
+                pruned["blocks"], pruned["arbitrages"], pruned["sandwiches"], self.history_start_block,
+            )
         self.stop_event.clear()
         self.head_ready_event.clear()
         if self.head_thread is None or not self.head_thread.is_alive():
@@ -741,7 +777,7 @@ class MevScanner:
         while not self.head_ready_event.is_set() and not self.stop_event.is_set():
             self.head_ready_event.wait(self.poll_seconds)
         number = first_block
-        while number >= self.backfill_start_block and not self.stop_event.is_set():
+        while number >= self.history_start_block and not self.stop_event.is_set():
             try:
                 if self.store.block_is_scanned(number):
                     number -= 1
@@ -763,8 +799,17 @@ class MevScanner:
 
     def explorer(self, limit: int = 180, before: int | None = None) -> dict[str, Any]:
         latest = int(self.web3.eth.block_number)
-        newest = min(latest, before if before is not None else latest)
-        oldest = max(0, newest - limit + 1)
+        session_start_value = self.store.metadata("session_start_block")
+        session_start = latest if session_start_value is None else int(session_start_value)
+        history_start_value = self.store.metadata("history_start_block")
+        history_start = (
+            max(0, session_start - self.history_blocks + 1)
+            if history_start_value is None
+            else int(history_start_value)
+        )
+        requested_newest = before if before is not None else latest
+        newest = max(history_start, min(latest, requested_newest))
+        oldest = max(history_start, newest - limit + 1)
         calls = [("eth_getBlockByNumber", [hex(number), False]) for number in range(newest, oldest - 1, -1)]
         headers = self._rpc_batch(calls)
         labels = self.store.labels(oldest, newest)
@@ -787,13 +832,14 @@ class MevScanner:
                 "arbitrage_count": saved.get("arbitrage_count", 0),
                 "sandwich_count": saved.get("sandwich_count", 0),
             })
-        start = self.store.metadata("start_block")
-        session_start = self.store.metadata("session_start_block")
         last = self.store.metadata("last_scanned")
         return {
             "latest": latest,
-            "start_block": None if start is None else int(start),
-            "session_start_block": None if session_start is None else int(session_start),
+            "start_block": history_start,
+            "session_start_block": session_start,
+            "history_blocks": self.history_blocks,
+            "has_newer": newest < latest,
+            "has_older": oldest > history_start,
             "last_scanned": None if last is None else int(last),
             "scanning_block": self.forward_block,
             "backfill_block": self.backfill_block,
@@ -812,5 +858,5 @@ def scanner_from_env(data_dir: Path) -> MevScanner:
         rpc_url,
         data_dir,
         float(os.environ.get("MEV_POLL_SECONDS", "3")),
-        int(os.environ.get("MEV_BACKFILL_START_BLOCK", str(GETH_TRACE_START_BLOCK))),
+        int(os.environ.get("MEV_HISTORY_BLOCKS", "1800")),
     )

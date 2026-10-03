@@ -1,56 +1,62 @@
 # Whole Block TFG
 
-Whole Block TFG 是一个面向 Ethereum 区块的价值流可视化与 MEV 探索工具。首页展示最新区块以及套利、Sandwich 快速标签；进入区块详情后，可查看交易级 Token Flow Graph、资金路径和检测结果。
+Whole Block TFG is an Ethereum value-flow visualizer and MEV explorer. The home page shows recent blocks with fast arbitrage and sandwich labels. Opening a block builds an interactive, transaction-level Token Flow Graph (TFG) with transfer paths, cycles, balance changes, and MEV findings.
 
-## 功能
+## Features
 
-- 实时展示链头与最新 180 个区块。
-- 从 receipt 中解析 Uniswap V2/V3 `Swap` Event，并结合 `callTracer` 推断其他资金流。
-- 快速标记套利路径与 Sandwich 交易。
-- 按需生成完整区块 Token Flow Graph，支持交易、边和周期维度查看。
-- 扫描结果与图数据本地缓存，避免重复分析。
+- Shows the live chain head and recent Ethereum blocks.
+- Decodes Uniswap V2/V3 `Swap` events from receipts and supplements them with `callTracer`-inferred flows.
+- Detects candidate arbitrage routes and sandwich transactions.
+- Builds full-block Token Flow Graphs on demand.
+- Supports block, transaction, edge-timeline, cycle, and MEV-focused views.
+- Caches scan labels, traces, and generated graphs locally.
+- Provides paginated access to the 1,800-block startup history window.
 
-## 同步模型
+## Synchronization model
 
-后端每次启动都把当时链头作为本次同步锚点：
+Every backend start anchors a new tracking session at the current chain head:
 
-- 链头线程优先扫描启动时的最新区块，之后持续跟踪新块。
-- 链头首次扫描成功后，历史线程从 `latest - 1` 向下回填，已扫描区块会自动跳过。
-- 前端直接读取最新区块头，因此打开系统后可立即看到最新区块，MEV 标签在扫描完成后更新。
+1. The head worker scans the startup head first, then continuously follows new blocks.
+2. After the initial head scan succeeds, the history worker scans the preceding 1,799 blocks in descending order.
+3. Blocks already present in the local scan database are skipped.
+4. The explorer reads block headers directly from the node, so the newest blocks are visible immediately while MEV labels are still being computed.
 
-## 环境要求
+The 1,800-block limit applies to backward filling. Blocks produced after startup continue to be tracked normally.
+Quick-scan rows older than the active startup window are pruned on restart. Full TFG artifacts under `data/<block>/` are never removed by this retention policy.
+
+## Requirements
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
-- Node.js `^20.19.0` 或 `>=22.12.0`
-- 开启 HTTP JSON-RPC 和 `debug` API 的 Geth 节点
-- 节点需支持 `eth_getBlockReceipts` 与 `debug_traceBlockByNumber`
+- Node.js `^20.19.0` or `>=22.12.0`
+- A Geth node with HTTP JSON-RPC and the `debug` API enabled
+- RPC support for `eth_getBlockReceipts` and `debug_traceBlockByNumber`
 
-> 历史回填能到达的最早高度取决于节点保留的历史 state。
+The node must retain historical state for every block that you want to trace.
 
-## 配置
+## Configuration
 
-复制示例配置：
+Copy the example environment file:
 
 ```bash
 cp backend/.env.example backend/.env
 ```
 
-然后编辑 `backend/.env`：
+Then edit `backend/.env`:
 
-| 变量 | 默认值 | 说明 |
+| Variable | Default | Description |
 | --- | --- | --- |
-| `GETH_API` | `http://127.0.0.1:8545` | Geth HTTP JSON-RPC 地址 |
-| `TRACE_WORKERS` | `2` | 完整 TFG 分析的并发数，限制在 1–8 |
-| `MEV_POLL_SECONDS` | `3` | 链头轮询间隔（秒） |
-| `MEV_BACKFILL_START_BLOCK` | `25676797` | 历史回填下界 |
-| `CORS_ORIGINS` | 本地前端地址 | 逗号分隔的允许来源 |
+| `GETH_API` | `http://127.0.0.1:8545` | Geth HTTP JSON-RPC endpoint |
+| `TRACE_WORKERS` | `2` | Full-TFG trace concurrency, clamped to 1–8 |
+| `MEV_POLL_SECONDS` | `3` | Chain-head polling interval in seconds |
+| `MEV_HISTORY_BLOCKS` | `1800` | Startup tracking window, including the startup head |
+| `CORS_ORIGINS` | Local frontend URLs | Comma-separated allowed browser origins |
 
-`backend/.env` 不会被 Git 跟踪。请不要提交带凭据的 RPC URL。
+`backend/.env` is ignored by Git. Never commit an authenticated RPC URL or other credentials.
 
-## 本地开发
+## Local development
 
-启动后端：
+Start the backend:
 
 ```bash
 cd backend
@@ -58,7 +64,7 @@ uv sync
 uv run uvicorn server:app --host 0.0.0.0 --port 9021
 ```
 
-在另一个终端启动前端：
+In another terminal, start the frontend:
 
 ```bash
 cd frontend
@@ -66,9 +72,9 @@ npm ci
 npm run dev
 ```
 
-访问 <http://localhost:9020>。Vite 开发服务器会将 API 请求转发到 `http://127.0.0.1:9021`。
+Open <http://localhost:9020>. The Vite development server sends API requests to `http://127.0.0.1:9021`.
 
-## 生产构建
+## Production build
 
 ```bash
 cd frontend
@@ -80,11 +86,11 @@ uv sync
 uv run uvicorn server:app --host 0.0.0.0 --port 9021
 ```
 
-前端构建到 `frontend/dist/` 后，FastAPI 会同时提供静态前端，此时访问 <http://localhost:9021>。
+When `frontend/dist/` exists, FastAPI serves the built frontend together with the API. Open <http://localhost:9021>.
 
-## 命令行分析
+## Command-line analysis
 
-不启动 Web 界面也可以分析指定区块：
+Analyze a block without opening the web interface:
 
 ```bash
 cd backend
@@ -92,29 +98,31 @@ uv run python cli.py latest
 uv run python cli.py 25976348 --force
 ```
 
-结果会写入项目根目录下的 `data/`。
+Generated traces and graph files are written under the repository's `data/` directory.
 
 ## API
 
-| 方法 | 路径 | 说明 |
+| Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/api/explorer?limit=180` | 读取最新区块和快速 MEV 标签 |
-| `GET` | `/api/latest` | 读取当前链头 |
-| `POST` | `/api/analyze` | 提交完整 TFG 分析任务 |
-| `GET` | `/api/jobs/{job_id}` | 查询分析进度 |
-| `GET` | `/api/blocks/{block_number}` | 读取已生成的图数据 |
+| `GET` | `/api/explorer?limit=180&before=...` | Read one page of block headers and fast MEV labels |
+| `GET` | `/api/latest` | Read the current chain head |
+| `POST` | `/api/analyze` | Submit a full-TFG analysis job |
+| `GET` | `/api/jobs/{job_id}` | Read analysis progress |
+| `GET` | `/api/blocks/{block_number}` | Read a generated block graph |
 
-## 测试
+## Tests
+
+From the repository root:
 
 ```bash
-uv run --with pytest pytest -q
+uv run --project backend --with pytest python -m pytest -q
 ```
 
-## 目录结构
+## Project layout
 
 ```text
-backend/       FastAPI API、trace 分析和 MEV 扫描器
-frontend/      Vue 3 + TypeScript + Vite 前端
-tests/         Python 单元测试
-data/          本地生成数据，不提交到 Git
+backend/       FastAPI API, trace analysis, and MEV scanner
+frontend/      Vue 3, TypeScript, and Vite frontend
+tests/         Python unit tests
+data/          Generated local data; excluded from Git
 ```
