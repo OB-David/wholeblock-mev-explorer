@@ -1,28 +1,8 @@
-# Whole Block TFG
+# WholeBlock MEV Explorer
 
-Whole Block TFG is an Ethereum value-flow visualizer and MEV explorer. The home page shows recent blocks with fast arbitrage and sandwich labels. Opening a block builds an interactive, transaction-level Token Flow Graph (TFG) with transfer paths, cycles, balance changes, and MEV findings.
+WholeBlock MEV Explorer provides two levels of Ethereum analysis: fast, Event-based MEV labeling across recent blocks, followed by on-demand, opcode-level trace analysis and interactive token-flow visualization for a selected block. The fast-labeling layer is adapted from [Flashbots' `mev-inspect-py`](https://github.com/flashbots/mev-inspect-py).
 
-## Features
-
-- Shows the live chain head and recent Ethereum blocks.
-- Decodes Uniswap V2/V3 `Swap` events from receipts and supplements them with `callTracer`-inferred flows.
-- Detects candidate arbitrage routes and sandwich transactions.
-- Builds full-block Token Flow Graphs on demand.
-- Supports block, transaction, edge-timeline, cycle, and MEV-focused views.
-- Caches scan labels, traces, and generated graphs locally.
-- Provides paginated access to the 1,800-block startup history window.
-
-## Synchronization model
-
-Every backend start anchors a new tracking session at the current chain head:
-
-1. The head worker scans the startup head first, then continuously follows new blocks.
-2. After the initial head scan succeeds, the history worker scans the preceding 1,799 blocks in descending order.
-3. Blocks already present in the local scan database are skipped.
-4. The explorer reads block headers directly from the node, so the newest blocks are visible immediately while MEV labels are still being computed.
-
-The 1,800-block limit applies to backward filling. Blocks produced after startup continue to be tracked normally.
-Quick-scan rows older than the active startup window are pruned on restart. Full TFG artifacts under `data/<block>/` are never removed by this retention policy.
+![WholeBlock MEV Explorer system overview](docs/images/system-overview.png)
 
 ## Requirements
 
